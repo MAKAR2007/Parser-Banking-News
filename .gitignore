@@ -1,0 +1,18 @@
+# Секреты и сессии — НИКОГДА не коммитим
+.env
+*.session
+*.session-journal
+subscribers.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
