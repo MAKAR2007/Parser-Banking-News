@@ -42,8 +42,23 @@ HEADERS = {
 }
 
 
+def _parse_views(raw: str) -> int:
+    """Преобразует строку просмотров t.me ('12.3K', '1.2M', '532') в число."""
+    if not raw:
+        return 0
+    s = raw.strip().upper().replace(",", ".").replace(" ", "")
+    try:
+        if s.endswith("K"):
+            return int(float(s[:-1]) * 1_000)
+        if s.endswith("M"):
+            return int(float(s[:-1]) * 1_000_000)
+        return int(float(s))
+    except (ValueError, TypeError):
+        return 0
+
+
 def _parse_posts(soup: BeautifulSoup, channel: str) -> list[dict]:
-    """Достаёт из HTML список постов: {'id', 'date'(aware), 'text', 'url'}."""
+    """Достаёт из HTML список постов: {'id', 'date'(aware), 'text', 'url', 'views'}."""
     posts = []
     for message in soup.select(".tgme_widget_message"):
         # Пропускаем служебные сообщения (закрепления, «pinned a photo» и т.п.).
