@@ -187,6 +187,7 @@ async def collect_all_posts(client: httpx.AsyncClient):
             title, posts = await scraper.fetch_channel_posts(
                 client, channel, yesterday_start, today_start, tz,
                 config.MAX_PAGES_PER_CHANNEL, config.REQUEST_DELAY,
+                config.REQUEST_RETRIES,
             )
         except Exception as exc:  # noqa: BLE001
             log.warning("Пропускаю @%s: %s", channel, exc)
@@ -441,7 +442,11 @@ async def main() -> None:
     # Короткий таймаут на установку соединения (быстро отбрасываем «мёртвые»
     # IP при флапе сети), но длинный на чтение — для long-poll getUpdates(25с).
     timeout = httpx.Timeout(35.0, connect=15.0)
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    client_kwargs = {"timeout": timeout}
+    if config.PROXY_URL:
+        client_kwargs["proxy"] = config.PROXY_URL
+        log.info("Использую прокси для всего трафика: %s", config.PROXY_URL)
+    async with httpx.AsyncClient(**client_kwargs) as client:
         # Сеть до Telegram может «флапать» — ждём успешного подключения,
         # а не падаем сразу. Это надёжнее под systemd.
         me = None

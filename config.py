@@ -85,3 +85,10 @@ SUBSCRIBERS_FILE = os.getenv("SUBSCRIBERS_FILE", "subscribers.json")
 MAX_PAGES_PER_CHANNEL = int(os.getenv("MAX_PAGES_PER_CHANNEL", "30"))
 # Пауза между запросами к t.me, сек (бережём сайт и не ловим лимиты).
 REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "0.7"))
+# Сколько раз повторять запрос страницы при сетевой ошибке (флап сети).
+REQUEST_RETRIES = int(os.getenv("REQUEST_RETRIES", "3"))
+
+# Необязательный прокси для ВСЕГО трафика бота (и t.me, и api.telegram.org).
+# Нужен, если сервер не имеет прямого доступа к Telegram.
+# Примеры: http://user:pass@host:port  |  socks5://user:pass@host:port
+PROXY_URL = os.getenv("PROXY_URL", "").strip()

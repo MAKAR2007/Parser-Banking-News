@@ -97,6 +97,7 @@ async def fetch_channel_posts(
     tz,
     max_pages: int,
     delay: float,
+    retries: int = 3,
 ) -> tuple[str, list[dict]]:
     """
     Возвращает (название_канала, список_постов за период [start, end)).
@@ -111,16 +112,26 @@ async def fetch_channel_posts(
     for _ in range(max_pages):
         url = f"https://t.me/s/{channel}"
         params = {"before": before} if before else None
-        try:
-            resp = await client.get(
-                url,
-                params=params,
-                headers=HEADERS,
-                follow_redirects=True,
-                timeout=httpx.Timeout(30.0, connect=15.0),
-            )
-        except Exception as exc:  # noqa: BLE001
-            log.warning("@%s: ошибка запроса: %s", channel, exc)
+
+        # Повторяем запрос при сетевой ошибке — сеть до Telegram может «флапать».
+        resp = None
+        for attempt in range(max(retries, 1)):
+            try:
+                resp = await client.get(
+                    url,
+                    params=params,
+                    headers=HEADERS,
+                    follow_redirects=True,
+                    timeout=httpx.Timeout(30.0, connect=15.0),
+                )
+                break
+            except Exception as exc:  # noqa: BLE001
+                if attempt + 1 >= max(retries, 1):
+                    log.warning("@%s: ошибка запроса после %d попыток: %r",
+                                channel, max(retries, 1), exc)
+                else:
+                    await asyncio.sleep(2 * (attempt + 1))
+        if resp is None:
             break
 
         if resp.status_code != 200:
