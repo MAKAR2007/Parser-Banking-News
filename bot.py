@@ -17,7 +17,9 @@ import asyncio
 import html
 import json
 import logging
+import math
 import os
+import statistics
 import time as time_module
 from datetime import datetime, timedelta
 
@@ -193,34 +195,114 @@ async def collect_all_posts(client: httpx.AsyncClient):
     return yesterday_start, results
 
 
-def build_digest_messages(date_label: str, results: list) -> list[str]:
-    """Собирает готовые к отправке сообщения с учётом лимита длины."""
-    total = sum(len(posts) for _, _, posts in results)
-    header = (
-        f"📰 <b>Сводка новостей за {date_label}</b>\n"
-        f"Всего постов: {total}\n\n"
-    )
+def _human_views(n: int) -> str:
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1000:
+        return f"{n / 1000:.1f}K"
+    return str(n)
 
-    if total == 0:
+
+def select_top_posts(results: list, target: int) -> tuple[list[dict], int]:
+    """
+    Отбирает самые интересные посты дня.
+
+    «Интересность» оцениваем по двум сигналам:
+      * абсолютный охват (просмотры) — насколько пост «громкий» вообще;
+      * относительный (просмотры / медиана канала) — насколько пост выстрелил
+        на фоне обычного уровня своего канала.
+    Относительный сигнал берём под корнем, чтобы высокочастотные каналы с
+    маленькими просмотрами не вытесняли по-настоящему вирусные новости.
+    Содержательные посты (с текстом) приоритетнее медиа-заглушек, и действует
+    лимит постов на один канал ради разнообразия топа.
+
+    Возвращает (отобранные_посты_в_порядке_убывания_интереса, всего_найдено).
+    """
+    scored: list[dict] = []
+    total_found = 0
+
+    for title, channel, posts in results:
+        total_found += len(posts)
+        if not posts:
+            continue
+        views_list = [max(p["views"], 0) for p in posts]
+        # Медиана как устойчивая база канала (защищаемся от нулей).
+        baseline = max(statistics.median(views_list), 1)
+
+        for p in posts:
+            text_len = len(p["text"].strip())
+            if text_len >= config.MIN_TEXT_LEN:
+                text_factor = 1.0
+            elif text_len > 0:
+                text_factor = 0.7
+            else:
+                text_factor = 0.35  # медиа без текста — в самом низу приоритета
+
+            relative = p["views"] / baseline           # во сколько раз обошёл норму канала
+            absolute = math.log10(p["views"] + 10)      # абсолютный охват (log)
+            score = math.sqrt(relative) * absolute * text_factor
+
+            scored.append(
+                {
+                    "title": title,
+                    "channel": channel,
+                    "text": p["text"],
+                    "url": p["url"],
+                    "views": p["views"],
+                    "score": score,
+                }
+            )
+
+    scored.sort(key=lambda x: x["score"], reverse=True)
+
+    # Отбор с лимитом на канал для разнообразия. Если после лимита постов
+    # не хватило до target — добираем оставшимися лучшими без ограничения.
+    selected: list[dict] = []
+    per_channel: dict[str, int] = {}
+    leftovers: list[dict] = []
+    for item in scored:
+        if len(selected) >= target:
+            break
+        ch = item["channel"]
+        if per_channel.get(ch, 0) < config.MAX_PER_CHANNEL:
+            selected.append(item)
+            per_channel[ch] = per_channel.get(ch, 0) + 1
+        else:
+            leftovers.append(item)
+    if len(selected) < target:
+        selected.extend(leftovers[: target - len(selected)])
+        selected.sort(key=lambda x: x["score"], reverse=True)
+
+    return selected, total_found
+
+
+def build_digest_messages(date_label: str, selected: list[dict], total_found: int) -> list[str]:
+    """Собирает готовые к отправке сообщения (с учётом лимита длины)."""
+    if not selected:
         return [
             f"📰 <b>Сводка новостей за {date_label}</b>\n\n"
-            f"За прошедший день новых постов в каналах не найдено."
+            f"За прошедший день подходящих постов не найдено."
         ]
 
+    header = (
+        f"📰 <b>Топ-{len(selected)} новостей за {date_label}</b>\n"
+        f"Отобрано из {total_found} постов за день.\n\n"
+    )
+
     blocks: list[str] = []
-    for title, channel, posts in results:
-        for p in posts:
-            summary = summarize(
-                p["text"],
-                max_sentences=config.SUMMARY_MAX_SENTENCES,
-                max_chars=config.SUMMARY_MAX_CHARS,
-            )
-            body = html.escape(summary) if summary else "<i>[пост без текста: фото / видео / файл]</i>"
-            blocks.append(
-                f"📌 <b>{html.escape(title)}</b>\n"
-                f"{body}\n"
-                f"🔗 {p['url']}\n"
-            )
+    for i, item in enumerate(selected, 1):
+        summary = summarize(
+            item["text"],
+            max_sentences=config.SUMMARY_MAX_SENTENCES,
+            max_chars=config.SUMMARY_MAX_CHARS,
+        )
+        body = html.escape(summary) if summary else "<i>[пост без текста: фото / видео / файл]</i>"
+        views_str = f"👁 {_human_views(item['views'])}  " if item["views"] else ""
+        blocks.append(
+            f"<b>{i}. {html.escape(item['title'])}</b>\n"
+            f"{body}\n"
+            f"{views_str}🔗 {item['url']}\n"
+        )
 
     messages: list[str] = []
     current = header
@@ -242,8 +324,12 @@ async def run_and_send(client: httpx.AsyncClient, targets: list[int] | None = No
         return
 
     date_start, results = await collect_all_posts(client)
-    messages = build_digest_messages(date_start.strftime("%d.%m.%Y"), results)
-    log.info("Сводка готова: %d сообщений, %d получателей.", len(messages), len(subscribers))
+    selected, total_found = select_top_posts(results, config.DIGEST_TARGET)
+    messages = build_digest_messages(date_start.strftime("%d.%m.%Y"), selected, total_found)
+    log.info(
+        "Сводка готова: топ-%d из %d постов, %d сообщений, %d получателей.",
+        len(selected), total_found, len(messages), len(subscribers),
+    )
 
     for chat_id in subscribers:
         for msg in messages:

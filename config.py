@@ -67,6 +67,14 @@ else:
 SUMMARY_MAX_SENTENCES = int(os.getenv("SUMMARY_MAX_SENTENCES", "2"))
 SUMMARY_MAX_CHARS = int(os.getenv("SUMMARY_MAX_CHARS", "400"))
 
+# Сколько лучших постов отбирать в дневную сводку (топ по популярности).
+# Если за день постов меньше — отправляются все найденные.
+DIGEST_TARGET = int(os.getenv("DIGEST_TARGET", "25"))
+# Максимум постов от одного канала в сводке (для разнообразия топа).
+MAX_PER_CHANNEL = int(os.getenv("MAX_PER_CHANNEL", "5"))
+# Минимальная длина текста, чтобы пост считался «содержательным» для топа.
+MIN_TEXT_LEN = int(os.getenv("MIN_TEXT_LEN", "40"))
+
 # Файл со списком подписчиков (chat_id)
 SUBSCRIBERS_FILE = os.getenv("SUBSCRIBERS_FILE", "subscribers.json")
 

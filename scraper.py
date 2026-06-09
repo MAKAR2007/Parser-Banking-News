@@ -13,6 +13,22 @@ from bs4 import BeautifulSoup
 
 log = logging.getLogger("parser-banking-news.scraper")
 
+
+def _parse_views(text: str) -> int:
+    """'21.9K' -> 21900, '1.5M' -> 1500000, '532' -> 532."""
+    if not text:
+        return 0
+    t = text.strip().upper().replace(",", ".")
+    mult = 1
+    if t.endswith("K"):
+        mult, t = 1000, t[:-1]
+    elif t.endswith("M"):
+        mult, t = 1_000_000, t[:-1]
+    try:
+        return int(float(t) * mult)
+    except ValueError:
+        return 0
+
 # Реалистичный User-Agent, чтобы Telegram отдавал полноценную веб-версию.
 HEADERS = {
     "User-Agent": (
@@ -56,11 +72,15 @@ def _parse_posts(soup: BeautifulSoup, channel: str) -> list[dict]:
         else:
             text = ""
 
+        views_el = message.select_one(".tgme_widget_message_views")
+        views = _parse_views(views_el.get_text()) if views_el else 0
+
         posts.append(
             {
                 "id": msg_id,
                 "date": dt,
                 "text": text,
+                "views": views,
                 "url": f"https://t.me/{channel}/{msg_id}",
             }
         )
