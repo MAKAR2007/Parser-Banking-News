@@ -1,13 +1,16 @@
 """
 Конфигурация бота. Все значения берутся из переменных окружения (.env).
-Ничего секретного в коде не хранится.
+Секреты в коде не хранятся.
+
+Важно: этой версии бота НЕ нужны api_id / api_hash. Посты читаются из публичной
+веб-версии каналов (t.me/s/<канал>), а рассылка идёт через обычный Bot API.
+Нужен только токен бота от @BotFather.
 """
 import os
 import sys
 
 from dotenv import load_dotenv
 
-# Загружаем .env из папки проекта
 load_dotenv()
 
 
@@ -23,33 +26,19 @@ def _require(name: str) -> str:
     return value
 
 
-# --- Обязательные параметры ---
-# api_id / api_hash берутся с https://my.telegram.org -> API development tools
-try:
-    API_ID = int(_require("API_ID"))
-except ValueError:
-    print("[CONFIG ERROR] API_ID должен быть числом.", file=sys.stderr)
-    sys.exit(1)
-
-API_HASH = _require("API_HASH")
+# --- Обязательное ---
 BOT_TOKEN = _require("BOT_TOKEN")
 
-# --- Необязательные параметры (с разумными значениями по умолчанию) ---
+# --- Необязательное (с разумными значениями по умолчанию) ---
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Moscow").strip()
 
-# Час и минута ежедневной отправки сводки (по TIMEZONE)
 try:
     SEND_HOUR = int(os.getenv("SEND_HOUR", "8"))
     SEND_MINUTE = int(os.getenv("SEND_MINUTE", "0"))
 except ValueError:
     SEND_HOUR, SEND_MINUTE = 8, 0
 
-# Имя файла пользовательской сессии Telethon (создаётся через login.py)
-USER_SESSION = os.getenv("USER_SESSION", "user_session")
-BOT_SESSION = os.getenv("BOT_SESSION", "bot_session")
-
-# Список каналов (username без @). Можно переопределить через переменную CHANNELS
-# (через запятую), иначе используется список по умолчанию.
+# Список каналов (username без @). Можно переопределить через CHANNELS в .env.
 _DEFAULT_CHANNELS = [
     "prbezposhady",
     "blogbankir",
@@ -78,9 +67,11 @@ else:
 SUMMARY_MAX_SENTENCES = int(os.getenv("SUMMARY_MAX_SENTENCES", "2"))
 SUMMARY_MAX_CHARS = int(os.getenv("SUMMARY_MAX_CHARS", "400"))
 
-# Файл со списком подписчиков (chat_id), которым уходит сводка
+# Файл со списком подписчиков (chat_id)
 SUBSCRIBERS_FILE = os.getenv("SUBSCRIBERS_FILE", "subscribers.json")
 
-# Ограничение на число просматриваемых сообщений в одном канале (защита от
-# бесконечного цикла на очень активных каналах)
-MAX_MESSAGES_PER_CHANNEL = int(os.getenv("MAX_MESSAGES_PER_CHANNEL", "400"))
+# Ограничения парсера веб-версии
+# Сколько страниц (по ~20 постов) максимум листать назад в одном канале.
+MAX_PAGES_PER_CHANNEL = int(os.getenv("MAX_PAGES_PER_CHANNEL", "30"))
+# Пауза между запросами к t.me, сек (бережём сайт и не ловим лимиты).
+REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "0.7"))
