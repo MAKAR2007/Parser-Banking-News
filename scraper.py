@@ -145,7 +145,9 @@ async def fetch_channel_posts(
                     log.warning("@%s: ошибка запроса после %d попыток: %r",
                                 channel, max(retries, 1), exc)
                 else:
-                    await asyncio.sleep(2 * (attempt + 1))
+                    # Сбои через прокси быстрые — короткая пауза, чтобы успеть
+                    # попасть в «хорошее окно» нестабильного соединения.
+                    await asyncio.sleep(1.5)
         if resp is None:
             break
 

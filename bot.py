@@ -120,12 +120,16 @@ def remove_subscriber(chat_id: int) -> bool:
 async def tg_call(client: httpx.AsyncClient, method: str, **params):
     """Вызов метода Bot API с обработкой 429 (rate limit) и сетевых ошибок."""
     url = f"{API_BASE}/{method}"
-    for attempt in range(4):
+    # Через прокси к Telegram соединение нестабильно, но сбои быстрые —
+    # поэтому делаем много дешёвых повторов с короткой паузой.
+    attempts = max(config.API_RETRIES, 1)
+    for attempt in range(attempts):
         try:
             resp = await client.post(url, json=params)
         except Exception as exc:  # noqa: BLE001
-            log.warning("Сетевая ошибка в %s (попытка %d): %s", method, attempt + 1, exc)
-            await asyncio.sleep(2 * (attempt + 1))
+            if attempt + 1 >= attempts:
+                log.warning("Сетевая ошибка в %s после %d попыток: %s", method, attempts, exc)
+            await asyncio.sleep(min(1.5 * (attempt + 1), 5))
             continue
 
         try:

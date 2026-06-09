@@ -85,8 +85,13 @@ SUBSCRIBERS_FILE = os.getenv("SUBSCRIBERS_FILE", "subscribers.json")
 MAX_PAGES_PER_CHANNEL = int(os.getenv("MAX_PAGES_PER_CHANNEL", "30"))
 # Пауза между запросами к t.me, сек (бережём сайт и не ловим лимиты).
 REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "0.7"))
-# Сколько раз повторять запрос страницы при сетевой ошибке (флап сети).
-REQUEST_RETRIES = int(os.getenv("REQUEST_RETRIES", "3"))
+# Сколько раз повторять запрос страницы при сетевой ошибке.
+# Через прокси (WARP) сбои возвращаются мгновенно, поэтому повторы дёшевы и их
+# можно делать много — это перекрывает «плохие окна» нестабильного канала.
+REQUEST_RETRIES = int(os.getenv("REQUEST_RETRIES", "12"))
+
+# Сколько раз повторять вызов Bot API (getMe/sendMessage/getUpdates) при сбое.
+API_RETRIES = int(os.getenv("API_RETRIES", "8"))
 
 # Необязательный прокси для ВСЕГО трафика бота (и t.me, и api.telegram.org).
 # Нужен, если сервер не имеет прямого доступа к Telegram.
