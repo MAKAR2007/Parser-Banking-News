@@ -6,6 +6,8 @@
 веб-версии каналов (t.me/s/<канал>), а рассылка идёт через обычный Bot API.
 Нужен только токен бота от @BotFather.
 """
+from __future__ import annotations
+
 import os
 import sys
 

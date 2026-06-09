@@ -4,6 +4,8 @@
 Не требует api_id/api_hash и вообще никакой авторизации — работает с тем же
 HTML, который Telegram отдаёт в браузере для публичных каналов.
 """
+from __future__ import annotations
+
 import asyncio
 import logging
 from datetime import datetime
