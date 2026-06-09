@@ -122,7 +122,7 @@ async def tg_call(client: httpx.AsyncClient, method: str, **params):
     url = f"{API_BASE}/{method}"
     for attempt in range(4):
         try:
-            resp = await client.post(url, json=params, timeout=40.0)
+            resp = await client.post(url, json=params)
         except Exception as exc:  # noqa: BLE001
             log.warning("Сетевая ошибка в %s (попытка %d): %s", method, attempt + 1, exc)
             await asyncio.sleep(2 * (attempt + 1))
@@ -438,7 +438,10 @@ async def main() -> None:
         except (NotImplementedError, RuntimeError):
             pass
 
-    async with httpx.AsyncClient() as client:
+    # Короткий таймаут на установку соединения (быстро отбрасываем «мёртвые»
+    # IP при флапе сети), но длинный на чтение — для long-poll getUpdates(25с).
+    timeout = httpx.Timeout(35.0, connect=15.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
         # Сеть до Telegram может «флапать» — ждём успешного подключения,
         # а не падаем сразу. Это надёжнее под systemd.
         me = None

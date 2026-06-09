@@ -117,7 +117,7 @@ async def fetch_channel_posts(
                 params=params,
                 headers=HEADERS,
                 follow_redirects=True,
-                timeout=30.0,
+                timeout=httpx.Timeout(30.0, connect=15.0),
             )
         except Exception as exc:  # noqa: BLE001
             log.warning("@%s: ошибка запроса: %s", channel, exc)
