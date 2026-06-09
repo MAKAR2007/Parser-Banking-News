@@ -21,6 +21,7 @@ import json
 import logging
 import math
 import os
+import signal
 import statistics
 import time as time_module
 from datetime import datetime, timedelta
@@ -403,9 +404,14 @@ async def poll_updates(client: httpx.AsyncClient) -> None:
         pass
 
     while True:
-        updates = await tg_call(client, "getUpdates", timeout=30, offset=offset)
-        if not updates:
+        updates = await tg_call(client, "getUpdates", timeout=25, offset=offset)
+        if updates is None:
+            # Ошибка API/сети (в т.ч. транзиентный 409 после перезапуска или
+            # «флап» сети). Не молотим API в плотном цикле — выдерживаем паузу.
+            await asyncio.sleep(3)
             continue
+        if not updates:
+            continue  # long-poll истёк без новых апдейтов — это норма
         for upd in updates:
             offset = upd["update_id"] + 1
             message = upd.get("message") or upd.get("channel_post")
@@ -422,14 +428,34 @@ async def poll_updates(client: httpx.AsyncClient) -> None:
 async def main() -> None:
     tz = get_tz()
 
+    # Корректное завершение по сигналу (важно под systemd, чтобы перезапуски
+    # не оставляли «висящих» long-poll и не плодили конфликтов getUpdates).
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, stop.set)
+        except (NotImplementedError, RuntimeError):
+            pass
+
     async with httpx.AsyncClient() as client:
-        me = await tg_call(client, "getMe")
-        if not me:
-            log.error(
-                "Не удалось подключиться к Telegram. Проверьте BOT_TOKEN в .env "
-                "и интернет-соединение."
+        # Сеть до Telegram может «флапать» — ждём успешного подключения,
+        # а не падаем сразу. Это надёжнее под systemd.
+        me = None
+        while not stop.is_set():
+            me = await tg_call(client, "getMe")
+            if me:
+                break
+            log.warning(
+                "Telegram недоступен (проверьте сеть/BOT_TOKEN). Повтор через 10 с..."
             )
-            return
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=10)
+            except asyncio.TimeoutError:
+                pass
+        if not me:
+            return  # получен сигнал остановки до подключения
+
         log.info("Бот запущен: @%s (id=%s).", me.get("username"), me.get("id"))
 
         scheduler = AsyncIOScheduler(timezone=tz)
@@ -451,7 +477,18 @@ async def main() -> None:
         )
         log.info("Откройте бота в Telegram и отправьте /start, чтобы подписаться.")
 
-        await poll_updates(client)
+        poll_task = asyncio.create_task(poll_updates(client))
+        await stop.wait()
+        log.info("Получен сигнал остановки, завершаю работу...")
+        poll_task.cancel()
+        try:
+            await poll_task
+        except asyncio.CancelledError:
+            pass
+        try:
+            scheduler.shutdown(wait=False)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 async def scheduled_job(client: httpx.AsyncClient) -> None:
