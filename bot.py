@@ -21,6 +21,7 @@ import json
 import logging
 import math
 import os
+import re
 import signal
 import statistics
 import time as time_module
@@ -30,6 +31,7 @@ import httpx
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 import config
+import relevance
 import scraper
 from summarizer import summarize
 
@@ -211,23 +213,53 @@ def _human_views(n: int) -> str:
     return str(n)
 
 
+_DEDUP_WORD_RE = re.compile(r"[а-яёa-z0-9]{4,}", re.IGNORECASE)
+
+
+def _dedup_tokens(text: str) -> set[str]:
+    """
+    Множество «стемов» (первые 5 букв значимых слов) из начала поста.
+    Грубый стемминг склеивает словоформы: «бюджета/бюджетов» -> «бюдже».
+    """
+    return {w[:5] for w in _DEDUP_WORD_RE.findall(text.lower()[:240])}
+
+
+def _is_duplicate(tokens: set[str], chosen: list[set[str]]) -> bool:
+    """
+    True, если новость почти совпадает с уже отобранной.
+    Метрика — containment (пересечение / меньшее множество): она устойчива к
+    разной длине пересказов одной и той же новости в разных каналах.
+    """
+    if not tokens:
+        return False
+    for other in chosen:
+        smaller = min(len(tokens), len(other))
+        if smaller == 0:
+            continue
+        # Для коротких текстов поднимаем порог, чтобы не склеить разные новости.
+        threshold = 0.8 if smaller < 5 else 0.6
+        if len(tokens & other) / smaller >= threshold:
+            return True
+    return False
+
+
 def select_top_posts(results: list, target: int) -> tuple[list[dict], int]:
     """
-    Отбирает самые интересные посты дня.
+    Отбирает самые релевантные и яркие посты дня для банковского новостного канала.
 
-    «Интересность» оцениваем по двум сигналам:
-      * абсолютный охват (просмотры) — насколько пост «громкий» вообще;
-      * относительный (просмотры / медиана канала) — насколько пост выстрелил
-        на фоне обычного уровня своего канала.
-    Относительный сигнал берём под корнем, чтобы высокочастотные каналы с
-    маленькими просмотрами не вытесняли по-настоящему вирусные новости.
-    Содержательные посты (с текстом) приоритетнее медиа-заглушек, и действует
-    лимит постов на один канал ради разнообразия топа.
+    Итоговый вес = вовлечённость × релевантность × качество текста, где:
+      * вовлечённость — √(просмотры/медиана канала) × log10(просмотры):
+        и абсолютный охват, и «выстрел» на фоне нормы своего канала;
+      * релевантность (relevance.py) — экономика/банки/финансы поднимают вес,
+        инфошум топит, мат и военная повестка исключаются полностью;
+      * качество текста — содержательные посты приоритетнее медиа-заглушек.
+    Плюс лимит постов на канал, чтобы топ был разнообразным.
 
-    Возвращает (отобранные_посты_в_порядке_убывания_интереса, всего_найдено).
+    Возвращает (отобранные_посты_по_убыванию_веса, всего_найдено).
     """
     scored: list[dict] = []
     total_found = 0
+    blocked_count = 0
 
     for title, channel, posts in results:
         total_found += len(posts)
@@ -238,6 +270,11 @@ def select_top_posts(results: list, target: int) -> tuple[list[dict], int]:
         baseline = max(statistics.median(views_list), 1)
 
         for p in posts:
+            rel_factor, rel_reason = relevance.score_text(p["text"])
+            if rel_factor <= 0:
+                blocked_count += 1
+                continue  # мат / военная повестка — никогда не публикуем
+
             text_len = len(p["text"].strip())
             if text_len >= config.MIN_TEXT_LEN:
                 text_factor = 1.0
@@ -248,7 +285,8 @@ def select_top_posts(results: list, target: int) -> tuple[list[dict], int]:
 
             relative = p["views"] / baseline           # во сколько раз обошёл норму канала
             absolute = math.log10(p["views"] + 10)      # абсолютный охват (log)
-            score = math.sqrt(relative) * absolute * text_factor
+            engagement = math.sqrt(relative) * absolute
+            score = engagement * rel_factor * text_factor
 
             scored.append(
                 {
@@ -258,59 +296,123 @@ def select_top_posts(results: list, target: int) -> tuple[list[dict], int]:
                     "url": p["url"],
                     "views": p["views"],
                     "score": score,
+                    "relevance": rel_reason,
+                    "rel_factor": rel_factor,
                 }
             )
 
+    log.info(
+        "Релевантность: %d постов оценено, %d исключено (мат/военная повестка).",
+        total_found, blocked_count,
+    )
     scored.sort(key=lambda x: x["score"], reverse=True)
 
-    # Отбор с лимитом на канал для разнообразия. Если после лимита постов
-    # не хватило до target — добираем оставшимися лучшими без ограничения.
+    # Отбор с лимитом на канал для разнообразия. Если после лимита постов не
+    # хватило до target — добираем сверх лимита, но ТОЛЬКО профильными постами
+    # (rel_factor > 1): лучше прислать меньше новостей, чем разбавлять инфошумом.
     selected: list[dict] = []
+    chosen_tokens: list[set[str]] = []
     per_channel: dict[str, int] = {}
     leftovers: list[dict] = []
     for item in scored:
         if len(selected) >= target:
             break
+        tokens = _dedup_tokens(item["text"])
+        if _is_duplicate(tokens, chosen_tokens):
+            continue  # та же новость из другого канала — берём только самую сильную
         ch = item["channel"]
         if per_channel.get(ch, 0) < config.MAX_PER_CHANNEL:
             selected.append(item)
+            chosen_tokens.append(tokens)
             per_channel[ch] = per_channel.get(ch, 0) + 1
-        else:
+        elif item["rel_factor"] > 1.0:
             leftovers.append(item)
     if len(selected) < target:
-        selected.extend(leftovers[: target - len(selected)])
+        for item in leftovers:
+            if len(selected) >= target:
+                break
+            tokens = _dedup_tokens(item["text"])
+            if not _is_duplicate(tokens, chosen_tokens):
+                selected.append(item)
+                chosen_tokens.append(tokens)
         selected.sort(key=lambda x: x["score"], reverse=True)
 
     return selected, total_found
 
 
-def build_digest_messages(date_label: str, selected: list[dict], total_found: int) -> list[str]:
-    """Собирает готовые к отправке сообщения (с учётом лимита длины)."""
+_MONTHS_RU = [
+    "января", "февраля", "марта", "апреля", "мая", "июня",
+    "июля", "августа", "сентября", "октября", "ноября", "декабря",
+]
+
+
+def _date_ru(d: datetime) -> str:
+    return f"{d.day} {_MONTHS_RU[d.month - 1]} {d.year}"
+
+
+def _headline_and_body(text: str) -> tuple[str, str]:
+    """
+    Делит выжимку на заголовок (первая фраза, до ~90 символов) и остальное.
+    Заголовок выделяется жирным — сводку можно сканировать глазами за секунды.
+    """
+    summary = summarize(
+        text,
+        max_sentences=config.SUMMARY_MAX_SENTENCES,
+        max_chars=config.SUMMARY_MAX_CHARS,
+    )
+    if not summary:
+        return "", ""
+    # Первая фраза — до точки/!/?/…, иначе первые ~90 символов.
+    m = re.match(r"(.{10,90}?[.!?…])\s+(.+)", summary, flags=re.DOTALL)
+    if m:
+        return m.group(1).strip(), m.group(2).strip()
+    if len(summary) <= 100:
+        return summary, ""
+    cut = summary[:90]
+    sp = cut.rfind(" ")
+    if sp > 40:
+        return cut[:sp].rstrip() + "…", summary[sp:].strip()
+    return summary, ""
+
+
+def build_digest_messages(date_start: datetime, selected: list[dict], total_found: int) -> list[str]:
+    """Собирает готовые к отправке сообщения (HTML, с учётом лимита длины)."""
+    date_label = _date_ru(date_start)
+
     if not selected:
         return [
-            f"📰 <b>Сводка новостей за {date_label}</b>\n\n"
-            f"За прошедший день подходящих постов не найдено."
+            "🏦 <b>Утренняя сводка</b>\n"
+            f"<i>{date_label}</i>\n\n"
+            "За прошедший день релевантных новостей не нашлось — "
+            "такое бывает в тихие дни. Завтра сводка придёт как обычно. ✨"
         ]
 
     header = (
-        f"📰 <b>Топ-{len(selected)} новостей за {date_label}</b>\n"
-        f"Отобрано из {total_found} постов за день.\n\n"
+        "🏦 <b>Утренняя сводка · главное за день</b>\n"
+        f"<i>{date_label} · {len(selected)} новостей из {total_found} постов</i>\n"
+        f"{'─' * 22}\n\n"
     )
 
     blocks: list[str] = []
     for i, item in enumerate(selected, 1):
-        summary = summarize(
-            item["text"],
-            max_sentences=config.SUMMARY_MAX_SENTENCES,
-            max_chars=config.SUMMARY_MAX_CHARS,
+        headline, body = _headline_and_body(item["text"])
+        if not headline:
+            headline, body = "Пост с фото/видео без текста", ""
+
+        views_part = f" · 👁 {_human_views(item['views'])}" if item["views"] else ""
+        lines = [f"<b>{i}. {html.escape(headline)}</b>"]
+        if body:
+            lines.append(html.escape(body))
+        lines.append(
+            f"<a href=\"{item['url']}\">{html.escape(item['title'])}</a>{views_part}"
         )
-        body = html.escape(summary) if summary else "<i>[пост без текста: фото / видео / файл]</i>"
-        views_str = f"👁 {_human_views(item['views'])}  " if item["views"] else ""
-        blocks.append(
-            f"<b>{i}. {html.escape(item['title'])}</b>\n"
-            f"{body}\n"
-            f"{views_str}🔗 {item['url']}\n"
-        )
+        blocks.append("\n".join(lines) + "\n")
+
+    footer = (
+        f"{'─' * 22}\n"
+        "<i>Следующая сводка — завтра в "
+        f"{config.SEND_HOUR:02d}:{config.SEND_MINUTE:02d} МСК · /digest — повторить</i>"
+    )
 
     messages: list[str] = []
     current = header
@@ -320,6 +422,8 @@ def build_digest_messages(date_label: str, selected: list[dict], total_found: in
             current = ""
         current += block + "\n"
     if current.strip():
+        if len(current) + len(footer) + 2 <= MAX_MESSAGE_LEN:
+            current = current.rstrip() + "\n\n" + footer
         messages.append(current.rstrip())
     return messages
 
@@ -333,7 +437,7 @@ async def run_and_send(client: httpx.AsyncClient, targets: list[int] | None = No
 
     date_start, results = await collect_all_posts(client)
     selected, total_found = select_top_posts(results, config.DIGEST_TARGET)
-    messages = build_digest_messages(date_start.strftime("%d.%m.%Y"), selected, total_found)
+    messages = build_digest_messages(date_start, selected, total_found)
     log.info(
         "Сводка готова: топ-%d из %d постов, %d сообщений, %d получателей.",
         len(selected), total_found, len(messages), len(subscribers),
@@ -358,43 +462,96 @@ async def handle_command(client: httpx.AsyncClient, message: dict) -> None:
     cmd = text.split()[0].lower().split("@")[0]  # /start@BotName -> /start
     when = f"{config.SEND_HOUR:02d}:{config.SEND_MINUTE:02d}"
 
+    help_text = (
+        "🏦 <b>Утренняя сводка — как это работает</b>\n\n"
+        f"Каждый день в <b>{when} МСК</b> я присылаю топ-{config.DIGEST_TARGET} "
+        "самых важных новостей экономики, банков и бизнеса — короткая выжимка "
+        "и ссылка на оригинал.\n\n"
+        "Новости отбираются из 15 деловых телеграм-каналов по охвату и "
+        "релевантности: экономика и финансы — в приоритете, инфошум — нет.\n\n"
+        "<b>Команды</b>\n"
+        "/digest — сводка за вчера прямо сейчас\n"
+        "/status — подписка, время рассылки, каналы\n"
+        "/stop — отписаться от рассылки\n"
+        "/help — это сообщение"
+    )
+
     if cmd == "/start":
         is_new = add_subscriber(chat_id)
         if is_new:
             reply = (
-                "✅ Вы подписаны на ежедневную сводку новостей.\n\n"
-                f"Каждый день в <b>{when}</b> ({config.TIMEZONE}) вы будете получать "
-                "краткую выжимку всех постов из отслеживаемых каналов за прошедший день.\n\n"
-                "Команды:\n"
-                "• /digest — прислать сводку за вчера сейчас\n"
-                "• /stop — отписаться"
+                "👋 Добро пожаловать!\n\n"
+                f"Вы подписаны: каждый день в <b>{when} МСК</b> сюда будет "
+                f"приходить топ-{config.DIGEST_TARGET} новостей экономики и "
+                "банков за прошедший день.\n\n"
+                "Хотите посмотреть, как это выглядит? Нажмите /digest — "
+                "пришлю сводку за вчера прямо сейчас. 👇"
             )
         else:
             reply = (
                 "Вы уже подписаны 👍\n\n"
-                f"Сводка приходит ежедневно в <b>{when}</b> ({config.TIMEZONE}).\n"
-                "• /digest — прислать сводку за вчера сейчас\n"
-                "• /stop — отписаться"
+                f"Сводка приходит ежедневно в <b>{when} МСК</b>.\n"
+                "/digest — сводка за вчера сейчас · /help — все команды"
             )
         await send_message(client, chat_id, reply)
         log.info("/start от chat_id=%s (новый: %s)", chat_id, is_new)
 
+    elif cmd == "/help":
+        await send_message(client, chat_id, help_text)
+
+    elif cmd == "/status":
+        subs = load_subscribers()
+        subscribed = chat_id in subs
+        reply = (
+            "📊 <b>Статус</b>\n\n"
+            f"Подписка: {'✅ активна' if subscribed else '❌ нет (включить — /start)'}\n"
+            f"Рассылка: ежедневно в <b>{when} МСК</b>\n"
+            f"Новостей в сводке: до {config.DIGEST_TARGET}\n"
+            f"Источников: {len(config.CHANNELS)} каналов\n"
+            f"Подписчиков у бота: {len(subs)}"
+        )
+        await send_message(client, chat_id, reply)
+
     elif cmd == "/stop":
         if remove_subscriber(chat_id):
-            await send_message(client, chat_id, "Вы отписались. Вернуться — /start.")
+            await send_message(
+                client, chat_id,
+                "Вы отписались от сводки. 😢\nПередумаете — просто нажмите /start.",
+            )
         else:
-            await send_message(client, chat_id, "Вы не были подписаны. Подписаться — /start.")
+            await send_message(client, chat_id, "Вы и так не подписаны. Подписаться — /start.")
 
     elif cmd == "/digest":
         # Игнорируем команды, накопившиеся пока бот не работал.
         if message.get("date", 0) < STARTED_AT:
             return
-        await send_message(client, chat_id, "⏳ Собираю сводку за вчера, это займёт до минуты...")
+        await send_message(
+            client, chat_id,
+            "⏳ Собираю и ранжирую новости за вчера — обычно это занимает меньше минуты…",
+        )
         try:
             await run_and_send(client, targets=[chat_id])
         except Exception as exc:  # noqa: BLE001
             log.exception("Ошибка в /digest: %s", exc)
-            await send_message(client, chat_id, "⚠️ Произошла ошибка при сборе сводки.")
+            await send_message(
+                client, chat_id,
+                "⚠️ Не получилось собрать сводку — попробуйте ещё раз через пару минут.",
+            )
+
+    elif cmd.startswith("/"):
+        await send_message(
+            client, chat_id,
+            "Не знаю такой команды 🤔\n/help — список всех команд.",
+        )
+
+    else:
+        # Обычный текст — мягко подсказываем, но только в личке (в группах молчим).
+        if chat.get("type") == "private":
+            await send_message(
+                client, chat_id,
+                "Я присылаю утреннюю сводку новостей и понимаю команды:\n"
+                "/digest — сводка за вчера · /help — подробнее",
+            )
 
 
 async def poll_updates(client: httpx.AsyncClient) -> None:
@@ -469,6 +626,18 @@ async def main() -> None:
             return  # получен сигнал остановки до подключения
 
         log.info("Бот запущен: @%s (id=%s).", me.get("username"), me.get("id"))
+
+        # Регистрируем меню команд в клиенте Telegram (кнопка «Меню» у поля ввода).
+        await tg_call(
+            client,
+            "setMyCommands",
+            commands=[
+                {"command": "digest", "description": "📰 Сводка за вчера прямо сейчас"},
+                {"command": "status", "description": "📊 Подписка и расписание"},
+                {"command": "help", "description": "ℹ️ Как работает бот"},
+                {"command": "stop", "description": "🔕 Отписаться от рассылки"},
+            ],
+        )
 
         scheduler = AsyncIOScheduler(timezone=tz)
         scheduler.add_job(
