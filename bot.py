@@ -241,60 +241,90 @@ def _is_low_quality(text: str) -> bool:
     return False
 
 
+_LATIN_RE = re.compile(r"[a-z]{3,}")
+_NUM_RE = re.compile(r"\d{3,}")
+# Латинский «шум», который не идентифицирует историю.
+_LATIN_STOP = {"the", "and", "you", "для", "com", "org", "www", "http", "https",
+               "for", "que", "его", "out", "new", "top", "max"}
+
+
+def _signature(text: str) -> tuple[frozenset, frozenset]:
+    """
+    «Сигнатура» истории: именованные сущности и конкретные числа.
+      • латиница (gmail, google, spacex, zcash, jpmorgan, recall…) — бренды/имена;
+      • числа из 3+ цифр, кроме годов (700, 500) — конкретные суммы/детали.
+    Совпадение сигнатур у двух постов — сильный признак одной новости, даже
+    когда история освещена многими каналами и общих слов мало.
+    """
+    low = text.lower()[:600]
+    lat = frozenset(w for w in _LATIN_RE.findall(low) if w not in _LATIN_STOP)
+    nums = frozenset(
+        n for n in _NUM_RE.findall(low) if not (1900 <= int(n) <= 2099)
+    )
+    return lat, nums
+
+
 def _make_dedup_checker(scored: list[dict]):
     """
-    Строит проверку дублей, устойчивую к парафразам одной новости в разных
-    каналах. Помимо лексического пересечения учитывает РЕДКИЕ общие основы:
-    если два поста делят несколько стемов, встречающихся во всём пуле всего в
-    паре постов (имена, бренды, спец-термины — «gmail», «recall»), это почти
-    наверняка одна история, даже если формулировки разные.
+    Проверка дублей, устойчивая к парафразам одной новости в разных каналах.
+    Три независимых сигнала; срабатывание любого = дубль:
+      1) почти дословный повтор (высокий containment стемов);
+      2) парафраз: заметная доля общих стемов + среди них есть редкие;
+      3) сигнатура: общие именованные сущности/числа (gmail+700) — ловит даже
+         широко растиражированные истории, где общих слов мало.
     """
     df: dict[str, int] = {}
     for it in scored:
         for t in it["_tokens"]:
             df[t] = df.get(t, 0) + 1
 
-    def is_duplicate(tokens: set[str], chosen: list[set[str]]) -> bool:
+    def is_duplicate(item: dict, chosen: list[dict]) -> bool:
+        tokens = item["_tokens"]
+        lat, nums = item["_lat"], item["_num"]
         if not tokens:
             return False
         for other in chosen:
-            smaller = min(len(tokens), len(other))
+            o_tokens = other["_tokens"]
+            smaller = min(len(tokens), len(o_tokens))
             if smaller == 0:
                 continue
-            shared = tokens & other
+            shared = tokens & o_tokens
             n_shared = len(shared)
             containment = n_shared / smaller
-            # 1) Почти дословный повтор: высокий containment.
+            # 1) Почти дословный повтор.
             threshold = 0.8 if smaller < 5 else 0.55
             if containment >= threshold:
                 return True
-            # 2) Парафраз одной новости: заметная доля общих основ И среди них
-            #    есть РЕДКИЕ (встречаются в пуле в паре постов — имена, бренды,
-            #    спец-термины: «gmail», «recall»). Общие частотные слова
-            #    (банк, ставка, рубль) не считаются — иначе склеим разные темы.
+            # 2) Парафраз с общими редкими стемами.
             if n_shared >= 3 and containment >= 0.28:
-                rare = [t for t in shared if df.get(t, 0) <= 4]
-                if len(rare) >= 2:
+                if sum(1 for t in shared if df.get(t, 0) <= 4) >= 2:
                     return True
+            # 3) Сигнатура: общие сущности/числа.
+            shared_lat = lat & other["_lat"]
+            shared_num = nums & other["_num"]
+            if len(shared_lat) >= 2:
+                return True   # две общие сущности — почти наверняка одна история
+            if shared_lat and (len(shared_lat) + len(shared_num)) >= 2 and containment >= 0.1:
+                return True   # сущность + конкретное число (gmail + 700)
         return False
 
     return is_duplicate
 
 
-def _pick_slot(candidates, score_key, limit, is_duplicate, chosen_tokens):
+def _pick_slot(candidates, score_key, limit, is_duplicate, chosen):
     """Жадно набирает посты в слот: дедуп + лимит на канал."""
     selected: list[dict] = []
     per_channel: dict[str, int] = {}
     for item in sorted(candidates, key=lambda x: x[score_key], reverse=True):
         if len(selected) >= limit:
             break
-        if is_duplicate(item["_tokens"], chosen_tokens):
+        if is_duplicate(item, chosen):
             continue
         ch = item["channel"]
         if per_channel.get(ch, 0) >= config.MAX_PER_CHANNEL:
             continue
         selected.append(item)
-        chosen_tokens.append(item["_tokens"])
+        chosen.append(item)
         per_channel[ch] = per_channel.get(ch, 0) + 1
     return selected
 
@@ -347,6 +377,7 @@ def select_top_posts(results: list) -> tuple[list[dict], list[dict], int]:
             absolute = math.log10(p["views"] + 10)
             engagement = math.sqrt(relative) * absolute
 
+            lat, nums = _signature(p["text"])
             scored.append(
                 {
                     "title": title,
@@ -360,6 +391,8 @@ def select_top_posts(results: list) -> tuple[list[dict], list[dict], int]:
                     "brightness": a.brightness,
                     "tag": a.tag,
                     "_tokens": _dedup_tokens(p["text"]),
+                    "_lat": lat,
+                    "_num": nums,
                 }
             )
 
@@ -369,7 +402,7 @@ def select_top_posts(results: list) -> tuple[list[dict], list[dict], int]:
     )
 
     is_duplicate = _make_dedup_checker(scored)
-    chosen_tokens: list[set[str]] = []
+    chosen: list[dict] = []
 
     # --- Слот A: Экономика (важно и понятно всем) ---
     # В слот идёт пост с реальной бытовой экономикой, КОТОРЫЙ при этом не
@@ -380,14 +413,14 @@ def select_top_posts(results: list) -> tuple[list[dict], list[dict], int]:
         and x["brightness"] <= x["econ_importance"] + 0.5
     ]
     econ_selected = _pick_slot(
-        econ_candidates, "econ_score", config.ECON_SLOTS, is_duplicate, chosen_tokens,
+        econ_candidates, "econ_score", config.ECON_SLOTS, is_duplicate, chosen,
     )
 
     # --- Слот B: Интересное (ярко и вирусно) ---
     econ_urls = {x["url"] for x in econ_selected}
     general_candidates = [x for x in scored if x["url"] not in econ_urls]
     general_selected = _pick_slot(
-        general_candidates, "general_score", config.GENERAL_SLOTS, is_duplicate, chosen_tokens,
+        general_candidates, "general_score", config.GENERAL_SLOTS, is_duplicate, chosen,
     )
 
     return econ_selected, general_selected, total_found
