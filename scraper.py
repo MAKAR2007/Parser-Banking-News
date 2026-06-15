@@ -8,28 +8,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from datetime import datetime
 
 import httpx
 from bs4 import BeautifulSoup
 
 log = logging.getLogger("parser-banking-news.scraper")
-
-
-def _parse_views(text: str) -> int:
-    """'21.9K' -> 21900, '1.5M' -> 1500000, '532' -> 532."""
-    if not text:
-        return 0
-    t = text.strip().upper().replace(",", ".")
-    mult = 1
-    if t.endswith("K"):
-        mult, t = 1000, t[:-1]
-    elif t.endswith("M"):
-        mult, t = 1_000_000, t[:-1]
-    try:
-        return int(float(t) * mult)
-    except ValueError:
-        return 0
 
 # Реалистичный User-Agent, чтобы Telegram отдавал полноценную веб-версию.
 HEADERS = {
@@ -55,6 +40,36 @@ def _parse_views(raw: str) -> int:
         return int(float(s))
     except (ValueError, TypeError):
         return 0
+
+
+# Хвосты-подписи каналов в конце поста: «@channel», «Подписаться», эмодзи+имя
+# канала («👍 Бэкдор»), призывы — для новостной выжимки это шум.
+_PROMO_TAIL_RE = re.compile(
+    r"(?:"
+    r"\s+@[A-Za-z0-9_]{3,}\s*$"                          # @handle в конце поста
+    r"|\n+\s*(?:[\W_]*\s*)?(?:подписаться|подпишись|подписывайтесь|"
+    r"наш канал|читать (?:дальше|полностью)|источник|"
+    r"прислать новость|предложить новость|реклама|сотрудничество)\b.*$"
+    r")",
+    re.IGNORECASE | re.DOTALL,
+)
+# Финальная строка вида «<эмодзи> Имя Канала» (самоподпись) — срезаем, если
+# это короткая строка из 1–4 слов с ведущим непечатным/эмодзи символом.
+_SIGN_LINE_RE = re.compile(r"\n+\s*[^\w\s]{1,3}\s*[A-ЯЁA-Z][\w ]{1,30}\s*$")
+
+
+def _clean_post_text(text: str) -> str:
+    """Убирает рекламные/служебные хвосты-подписи в конце поста."""
+    if not text:
+        return ""
+    cleaned = text
+    for _ in range(3):  # хвостов может быть несколько подряд
+        new = _PROMO_TAIL_RE.sub("", cleaned)
+        new = _SIGN_LINE_RE.sub("", new)
+        if new == cleaned:
+            break
+        cleaned = new
+    return cleaned.strip()
 
 
 def _parse_posts(soup: BeautifulSoup, channel: str) -> list[dict]:
@@ -85,7 +100,7 @@ def _parse_posts(soup: BeautifulSoup, channel: str) -> list[dict]:
         text_el = message.select_one(".tgme_widget_message_text")
         if text_el is not None:
             # separator="\n" сохраняет переносы строк из <br>.
-            text = text_el.get_text(separator="\n").strip()
+            text = _clean_post_text(text_el.get_text(separator="\n").strip())
         else:
             text = ""
 

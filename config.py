@@ -76,6 +76,9 @@ ECON_SLOTS = int(os.getenv("ECON_SLOTS", "5"))
 GENERAL_SLOTS = int(os.getenv("GENERAL_SLOTS", "15"))
 # Устаревший параметр, оставлен для совместимости с логами.
 DIGEST_TARGET = ECON_SLOTS + GENERAL_SLOTS
+# Порог экономической важности, чтобы пост попал в слот «Экономика».
+# 0.6 ≈ хотя бы одно «бытовое» слово (ставка/инфляция/цены/пенсии/налоги).
+ECON_MIN_IMPORTANCE = float(os.getenv("ECON_MIN_IMPORTANCE", "0.55"))
 # Максимум постов от одного канала в сводке (для разнообразия топа).
 MAX_PER_CHANNEL = int(os.getenv("MAX_PER_CHANNEL", "5"))
 # Минимальная длина текста, чтобы пост считался «содержательным» для топа.

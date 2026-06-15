@@ -214,55 +214,108 @@ def _human_views(n: int) -> str:
 
 
 _DEDUP_WORD_RE = re.compile(r"[а-яёa-z0-9]{4,}", re.IGNORECASE)
+_CONTENT_WORD_RE = re.compile(r"[а-яёa-z]{4,}", re.IGNORECASE)
 
 
 def _dedup_tokens(text: str) -> set[str]:
-    """
-    Множество «стемов» (первые 5 букв значимых слов) из начала поста.
-    Грубый стемминг склеивает словоформы: «бюджета/бюджетов» -> «бюдже».
-    """
-    return {w[:5] for w in _DEDUP_WORD_RE.findall(text.lower()[:240])}
+    """Множество «стемов» (первые 5 букв значимых слов) из начала поста."""
+    return {w[:5] for w in _DEDUP_WORD_RE.findall(text.lower()[:400])}
 
 
-def _is_duplicate(tokens: set[str], chosen: list[set[str]]) -> bool:
+def _is_low_quality(text: str) -> bool:
     """
-    True, если новость почти совпадает с уже отобранной.
-    Метрика — containment (пересечение / меньшее множество): она устойчива к
-    разной длине пересказов одной и той же новости в разных каналах.
+    True для «мусорных» постов: подписи-заглушки вроде «руб. руб.», голые числа,
+    повтор одного слова. Такие посты в сводку пускать нельзя.
     """
-    if not tokens:
-        return False
-    for other in chosen:
-        smaller = min(len(tokens), len(other))
-        if smaller == 0:
-            continue
-        # Для коротких текстов поднимаем порог, чтобы не склеить разные новости.
-        threshold = 0.8 if smaller < 5 else 0.6
-        if len(tokens & other) / smaller >= threshold:
-            return True
+    low = text.lower()
+    content = _CONTENT_WORD_RE.findall(low)
+    if len({w[:6] for w in content}) < 2:
+        return True  # меньше двух разных содержательных слов
+    tokens = _DEDUP_WORD_RE.findall(low)
+    if tokens:
+        top = max(tokens.count(t) for t in set(tokens))
+        if len(tokens) <= 6 and top / len(tokens) >= 0.6:
+            return True  # короткий текст из повторов одного слова
     return False
+
+
+def _make_dedup_checker(scored: list[dict]):
+    """
+    Строит проверку дублей, устойчивую к парафразам одной новости в разных
+    каналах. Помимо лексического пересечения учитывает РЕДКИЕ общие основы:
+    если два поста делят несколько стемов, встречающихся во всём пуле всего в
+    паре постов (имена, бренды, спец-термины — «gmail», «recall»), это почти
+    наверняка одна история, даже если формулировки разные.
+    """
+    df: dict[str, int] = {}
+    for it in scored:
+        for t in it["_tokens"]:
+            df[t] = df.get(t, 0) + 1
+
+    def is_duplicate(tokens: set[str], chosen: list[set[str]]) -> bool:
+        if not tokens:
+            return False
+        for other in chosen:
+            smaller = min(len(tokens), len(other))
+            if smaller == 0:
+                continue
+            shared = tokens & other
+            n_shared = len(shared)
+            containment = n_shared / smaller
+            # 1) Почти дословный повтор: высокий containment.
+            threshold = 0.8 if smaller < 5 else 0.55
+            if containment >= threshold:
+                return True
+            # 2) Парафраз одной новости: заметная доля общих основ И среди них
+            #    есть РЕДКИЕ (встречаются в пуле в паре постов — имена, бренды,
+            #    спец-термины: «gmail», «recall»). Общие частотные слова
+            #    (банк, ставка, рубль) не считаются — иначе склеим разные темы.
+            if n_shared >= 3 and containment >= 0.33:
+                rare = [t for t in shared if df.get(t, 0) <= 4]
+                if len(rare) >= 2:
+                    return True
+        return False
+
+    return is_duplicate
+
+
+def _pick_slot(candidates, score_key, limit, is_duplicate, chosen_tokens):
+    """Жадно набирает посты в слот: дедуп + лимит на канал."""
+    selected: list[dict] = []
+    per_channel: dict[str, int] = {}
+    for item in sorted(candidates, key=lambda x: x[score_key], reverse=True):
+        if len(selected) >= limit:
+            break
+        if is_duplicate(item["_tokens"], chosen_tokens):
+            continue
+        ch = item["channel"]
+        if per_channel.get(ch, 0) >= config.MAX_PER_CHANNEL:
+            continue
+        selected.append(item)
+        chosen_tokens.append(item["_tokens"])
+        per_channel[ch] = per_channel.get(ch, 0) + 1
+    return selected
 
 
 def select_top_posts(results: list) -> tuple[list[dict], list[dict], int]:
     """
-    Двухслотовый отбор для дайджеста:
+    Двухслотовый отбор для дайджеста с РАЗНЫМИ критериями у слотов:
 
-    Слот A (ECON_SLOTS=5) — «Экономика»:
-      Отбираем посты с высокой тематической релевантностью (банки/макро/финансы).
-      Формула: охват × rel_factor² — квадрат сильно штрафует нерелевантное.
-      Только посты с rel_factor > 1.0 (есть хотя бы одно профильное слово).
+    Слот A (ECON_SLOTS) — «Экономика»: важные и понятные всем новости про
+      деньги. Кандидаты — посты с заметной `econ_importance`; ранжируем по
+      `econ_importance × охват`, чтобы наверх шли и важные, и широко прочитанные.
 
-    Слот B (GENERAL_SLOTS=15) — «Интересное»:
-      Вирусные/интересные посты для широкой аудитории. Охват в приоритете,
-      жёсткий фильтр (мат/война) сохраняется, требования к теме сняты.
-      Формула: охват × max(rel_factor, 0.45) — охват решает.
+    Слот B (GENERAL_SLOTS) — «Интересное»: ЯРКИЕ, вирусные новости. Ранжируем по
+      `яркость × охват` — финансовый жаргон тут НЕ поощряется, сухая аналитика
+      получает штраф. Решают охват и «цепляющесть».
 
-    Дедупликация работает сквозная: одна история не попадёт в оба слота.
-    Возвращает (econ_posts, general_posts, total_found).
+    Общее: мусорные/рекламные/матерные посты отсекаются, дедуп — сквозной
+    (одна история не попадёт в оба слота и не повторится внутри слота).
     """
     scored: list[dict] = []
     total_found = 0
     blocked_count = 0
+    junk_count = 0
 
     for title, channel, posts in results:
         total_found += len(posts)
@@ -272,10 +325,13 @@ def select_top_posts(results: list) -> tuple[list[dict], list[dict], int]:
         baseline = max(statistics.median(views_list), 1)
 
         for p in posts:
-            rel_factor, rel_reason = relevance.score_text(p["text"])
-            if rel_factor <= 0:
+            a = relevance.analyze(p["text"])
+            if a.blocked:
                 blocked_count += 1
                 continue  # мат / военная повестка — никогда не публикуем
+            if _is_low_quality(p["text"]):
+                junk_count += 1
+                continue  # «руб. руб.», голые числа, повторы — мусор
 
             text_len = len(p["text"].strip())
             if text_len >= config.MIN_TEXT_LEN:
@@ -296,57 +352,41 @@ def select_top_posts(results: list) -> tuple[list[dict], list[dict], int]:
                     "text": p["text"],
                     "url": p["url"],
                     "views": p["views"],
-                    "econ_score": engagement * (rel_factor ** 2) * text_factor,
-                    "general_score": engagement * max(rel_factor, 0.45) * text_factor,
-                    "relevance": rel_reason,
-                    "rel_factor": rel_factor,
+                    "econ_score": engagement * a.econ_importance * text_factor,
+                    "general_score": engagement * a.brightness * text_factor,
+                    "econ_importance": a.econ_importance,
+                    "brightness": a.brightness,
+                    "tag": a.tag,
+                    "_tokens": _dedup_tokens(p["text"]),
                 }
             )
 
     log.info(
-        "Оценено: %d постов, исключено %d (мат/военная повестка).",
-        total_found, blocked_count,
+        "Оценено: %d постов, исключено %d (мат/война), %d мусора.",
+        total_found, blocked_count, junk_count,
     )
 
-    # --- Слот A: Экономика ---
-    econ_candidates = sorted(
-        [x for x in scored if x["rel_factor"] > 1.0],
-        key=lambda x: x["econ_score"], reverse=True,
-    )
-    econ_selected: list[dict] = []
+    is_duplicate = _make_dedup_checker(scored)
     chosen_tokens: list[set[str]] = []
-    per_channel_econ: dict[str, int] = {}
-    for item in econ_candidates:
-        if len(econ_selected) >= config.ECON_SLOTS:
-            break
-        tokens = _dedup_tokens(item["text"])
-        if _is_duplicate(tokens, chosen_tokens):
-            continue
-        ch = item["channel"]
-        if per_channel_econ.get(ch, 0) < config.MAX_PER_CHANNEL:
-            econ_selected.append(item)
-            chosen_tokens.append(tokens)
-            per_channel_econ[ch] = per_channel_econ.get(ch, 0) + 1
 
-    # --- Слот B: Интересное ---
-    econ_urls = {x["url"] for x in econ_selected}
-    general_candidates = sorted(
-        [x for x in scored if x["url"] not in econ_urls],
-        key=lambda x: x["general_score"], reverse=True,
+    # --- Слот A: Экономика (важно и понятно всем) ---
+    # В слот идёт пост с реальной бытовой экономикой, КОТОРЫЙ при этом не
+    # является явно «яркой» tech/виральной новостью (тогда его место — в B).
+    econ_candidates = [
+        x for x in scored
+        if x["econ_importance"] >= config.ECON_MIN_IMPORTANCE
+        and x["brightness"] <= x["econ_importance"] + 0.5
+    ]
+    econ_selected = _pick_slot(
+        econ_candidates, "econ_score", config.ECON_SLOTS, is_duplicate, chosen_tokens,
     )
-    general_selected: list[dict] = []
-    per_channel_gen: dict[str, int] = {}
-    for item in general_candidates:
-        if len(general_selected) >= config.GENERAL_SLOTS:
-            break
-        tokens = _dedup_tokens(item["text"])
-        if _is_duplicate(tokens, chosen_tokens):
-            continue
-        ch = item["channel"]
-        if per_channel_gen.get(ch, 0) < config.MAX_PER_CHANNEL:
-            general_selected.append(item)
-            chosen_tokens.append(tokens)
-            per_channel_gen[ch] = per_channel_gen.get(ch, 0) + 1
+
+    # --- Слот B: Интересное (ярко и вирусно) ---
+    econ_urls = {x["url"] for x in econ_selected}
+    general_candidates = [x for x in scored if x["url"] not in econ_urls]
+    general_selected = _pick_slot(
+        general_candidates, "general_score", config.GENERAL_SLOTS, is_duplicate, chosen_tokens,
+    )
 
     return econ_selected, general_selected, total_found
 
@@ -361,10 +401,17 @@ def _date_ru(d: datetime) -> str:
     return f"{d.day} {_MONTHS_RU[d.month - 1]} {d.year}"
 
 
+_SENT_BOUNDARY_RE = re.compile(r"(?<=[.!?…])\s+")
+
+
 def _headline_and_body(text: str) -> tuple[str, str]:
     """
-    Делит выжимку на заголовок (первая фраза, до ~90 символов) и остальное.
-    Заголовок выделяется жирным — сводку можно сканировать глазами за секунды.
+    Делит выжимку на жирный заголовок и тело — СТРОГО по границе предложений,
+    чтобы фраза никогда не рвалась посередине («…консультанта по…»).
+
+    Заголовок — первое предложение целиком; тело — остальные. Если первое
+    предложение слишком длинное, мягко подрезаем его по границе слова с «…»
+    (и тогда тело не показываем, чтобы не плодить обрывки).
     """
     summary = summarize(
         text,
@@ -373,17 +420,22 @@ def _headline_and_body(text: str) -> tuple[str, str]:
     )
     if not summary:
         return "", ""
-    # Первая фраза — до точки/!/?/…, иначе первые ~90 символов.
-    m = re.match(r"(.{10,90}?[.!?…])\s+(.+)", summary, flags=re.DOTALL)
-    if m:
-        return m.group(1).strip(), m.group(2).strip()
-    if len(summary) <= 100:
-        return summary, ""
-    cut = summary[:90]
-    sp = cut.rfind(" ")
-    if sp > 40:
-        return cut[:sp].rstrip() + "…", summary[sp:].strip()
-    return summary, ""
+
+    parts = [s.strip() for s in _SENT_BOUNDARY_RE.split(summary) if s.strip()]
+    if not parts:
+        return summary.strip(), ""
+
+    headline = parts[0]
+    body = " ".join(parts[1:]).strip()
+
+    # Слишком длинное первое предложение — подрезаем по слову, тело убираем.
+    if len(headline) > 170:
+        cut = headline[:160]
+        sp = cut.rfind(" ")
+        if sp > 80:
+            headline = cut[:sp].rstrip(" ,.;:—-") + "…"
+            body = ""
+    return headline, body
 
 
 def build_digest_messages(
