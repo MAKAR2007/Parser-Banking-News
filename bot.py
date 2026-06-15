@@ -299,13 +299,18 @@ def _make_dedup_checker(scored: list[dict]):
             if n_shared >= 3 and containment >= 0.28:
                 if sum(1 for t in shared if df.get(t, 0) <= 4) >= 2:
                     return True
-            # 3) Сигнатура: общие сущности/числа.
+            # 3) Сигнатура: общие сущности/числа. Ловит даже растиражированные
+            #    истории. Латинская сущность (gmail/spacex) — сильный маркер;
+            #    у новостей без латиницы (две заметки про ЦБ) этот путь молчит.
             shared_lat = lat & other["_lat"]
             shared_num = nums & other["_num"]
-            if len(shared_lat) >= 2:
-                return True   # две общие сущности — почти наверняка одна история
-            if shared_lat and (len(shared_lat) + len(shared_num)) >= 2 and containment >= 0.1:
-                return True   # сущность + конкретное число (gmail + 700)
+            if shared_lat:
+                if len(shared_lat) >= 2:
+                    return True                       # две общие сущности
+                if shared_num and containment >= 0.1:
+                    return True                       # сущность + число (gmail+700)
+                if n_shared >= 5 or containment >= 0.2:
+                    return True                       # сущность + сильное пересечение
         return False
 
     return is_duplicate
