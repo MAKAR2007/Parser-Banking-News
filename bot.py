@@ -243,19 +243,22 @@ def _is_duplicate(tokens: set[str], chosen: list[set[str]]) -> bool:
     return False
 
 
-def select_top_posts(results: list, target: int) -> tuple[list[dict], int]:
+def select_top_posts(results: list) -> tuple[list[dict], list[dict], int]:
     """
-    Отбирает самые релевантные и яркие посты дня для банковского новостного канала.
+    Двухслотовый отбор для дайджеста:
 
-    Итоговый вес = вовлечённость × релевантность × качество текста, где:
-      * вовлечённость — √(просмотры/медиана канала) × log10(просмотры):
-        и абсолютный охват, и «выстрел» на фоне нормы своего канала;
-      * релевантность (relevance.py) — экономика/банки/финансы поднимают вес,
-        инфошум топит, мат и военная повестка исключаются полностью;
-      * качество текста — содержательные посты приоритетнее медиа-заглушек.
-    Плюс лимит постов на канал, чтобы топ был разнообразным.
+    Слот A (ECON_SLOTS=5) — «Экономика»:
+      Отбираем посты с высокой тематической релевантностью (банки/макро/финансы).
+      Формула: охват × rel_factor² — квадрат сильно штрафует нерелевантное.
+      Только посты с rel_factor > 1.0 (есть хотя бы одно профильное слово).
 
-    Возвращает (отобранные_посты_по_убыванию_веса, всего_найдено).
+    Слот B (GENERAL_SLOTS=15) — «Интересное»:
+      Вирусные/интересные посты для широкой аудитории. Охват в приоритете,
+      жёсткий фильтр (мат/война) сохраняется, требования к теме сняты.
+      Формула: охват × max(rel_factor, 0.45) — охват решает.
+
+    Дедупликация работает сквозная: одна история не попадёт в оба слота.
+    Возвращает (econ_posts, general_posts, total_found).
     """
     scored: list[dict] = []
     total_found = 0
@@ -266,7 +269,6 @@ def select_top_posts(results: list, target: int) -> tuple[list[dict], int]:
         if not posts:
             continue
         views_list = [max(p["views"], 0) for p in posts]
-        # Медиана как устойчивая база канала (защищаемся от нулей).
         baseline = max(statistics.median(views_list), 1)
 
         for p in posts:
@@ -281,12 +283,11 @@ def select_top_posts(results: list, target: int) -> tuple[list[dict], int]:
             elif text_len > 0:
                 text_factor = 0.7
             else:
-                text_factor = 0.35  # медиа без текста — в самом низу приоритета
+                text_factor = 0.35
 
-            relative = p["views"] / baseline           # во сколько раз обошёл норму канала
-            absolute = math.log10(p["views"] + 10)      # абсолютный охват (log)
+            relative = p["views"] / baseline
+            absolute = math.log10(p["views"] + 10)
             engagement = math.sqrt(relative) * absolute
-            score = engagement * rel_factor * text_factor
 
             scored.append(
                 {
@@ -295,49 +296,59 @@ def select_top_posts(results: list, target: int) -> tuple[list[dict], int]:
                     "text": p["text"],
                     "url": p["url"],
                     "views": p["views"],
-                    "score": score,
+                    "econ_score": engagement * (rel_factor ** 2) * text_factor,
+                    "general_score": engagement * max(rel_factor, 0.45) * text_factor,
                     "relevance": rel_reason,
                     "rel_factor": rel_factor,
                 }
             )
 
     log.info(
-        "Релевантность: %d постов оценено, %d исключено (мат/военная повестка).",
+        "Оценено: %d постов, исключено %d (мат/военная повестка).",
         total_found, blocked_count,
     )
-    scored.sort(key=lambda x: x["score"], reverse=True)
 
-    # Отбор с лимитом на канал для разнообразия. Если после лимита постов не
-    # хватило до target — добираем сверх лимита, но ТОЛЬКО профильными постами
-    # (rel_factor > 1): лучше прислать меньше новостей, чем разбавлять инфошумом.
-    selected: list[dict] = []
+    # --- Слот A: Экономика ---
+    econ_candidates = sorted(
+        [x for x in scored if x["rel_factor"] > 1.0],
+        key=lambda x: x["econ_score"], reverse=True,
+    )
+    econ_selected: list[dict] = []
     chosen_tokens: list[set[str]] = []
-    per_channel: dict[str, int] = {}
-    leftovers: list[dict] = []
-    for item in scored:
-        if len(selected) >= target:
+    per_channel_econ: dict[str, int] = {}
+    for item in econ_candidates:
+        if len(econ_selected) >= config.ECON_SLOTS:
             break
         tokens = _dedup_tokens(item["text"])
         if _is_duplicate(tokens, chosen_tokens):
-            continue  # та же новость из другого канала — берём только самую сильную
+            continue
         ch = item["channel"]
-        if per_channel.get(ch, 0) < config.MAX_PER_CHANNEL:
-            selected.append(item)
+        if per_channel_econ.get(ch, 0) < config.MAX_PER_CHANNEL:
+            econ_selected.append(item)
             chosen_tokens.append(tokens)
-            per_channel[ch] = per_channel.get(ch, 0) + 1
-        elif item["rel_factor"] > 1.0:
-            leftovers.append(item)
-    if len(selected) < target:
-        for item in leftovers:
-            if len(selected) >= target:
-                break
-            tokens = _dedup_tokens(item["text"])
-            if not _is_duplicate(tokens, chosen_tokens):
-                selected.append(item)
-                chosen_tokens.append(tokens)
-        selected.sort(key=lambda x: x["score"], reverse=True)
+            per_channel_econ[ch] = per_channel_econ.get(ch, 0) + 1
 
-    return selected, total_found
+    # --- Слот B: Интересное ---
+    econ_urls = {x["url"] for x in econ_selected}
+    general_candidates = sorted(
+        [x for x in scored if x["url"] not in econ_urls],
+        key=lambda x: x["general_score"], reverse=True,
+    )
+    general_selected: list[dict] = []
+    per_channel_gen: dict[str, int] = {}
+    for item in general_candidates:
+        if len(general_selected) >= config.GENERAL_SLOTS:
+            break
+        tokens = _dedup_tokens(item["text"])
+        if _is_duplicate(tokens, chosen_tokens):
+            continue
+        ch = item["channel"]
+        if per_channel_gen.get(ch, 0) < config.MAX_PER_CHANNEL:
+            general_selected.append(item)
+            chosen_tokens.append(tokens)
+            per_channel_gen[ch] = per_channel_gen.get(ch, 0) + 1
+
+    return econ_selected, general_selected, total_found
 
 
 _MONTHS_RU = [
@@ -375,11 +386,17 @@ def _headline_and_body(text: str) -> tuple[str, str]:
     return summary, ""
 
 
-def build_digest_messages(date_start: datetime, selected: list[dict], total_found: int) -> list[str]:
+def build_digest_messages(
+    date_start: datetime,
+    econ_posts: list[dict],
+    general_posts: list[dict],
+    total_found: int,
+) -> list[str]:
     """Собирает готовые к отправке сообщения (HTML, с учётом лимита длины)."""
     date_label = _date_ru(date_start)
+    total_selected = len(econ_posts) + len(general_posts)
 
-    if not selected:
+    if not econ_posts and not general_posts:
         return [
             "🏦 <b>Утренняя сводка</b>\n"
             f"<i>{date_label}</i>\n\n"
@@ -389,16 +406,14 @@ def build_digest_messages(date_start: datetime, selected: list[dict], total_foun
 
     header = (
         "🏦 <b>Утренняя сводка · главное за день</b>\n"
-        f"<i>{date_label} · {len(selected)} новостей из {total_found} постов</i>\n"
+        f"<i>{date_label} · {total_selected} новостей из {total_found} постов</i>\n"
         f"{'─' * 22}\n\n"
     )
 
-    blocks: list[str] = []
-    for i, item in enumerate(selected, 1):
+    def _post_block(i: int, item: dict) -> str:
         headline, body = _headline_and_body(item["text"])
         if not headline:
             headline, body = "Пост с фото/видео без текста", ""
-
         views_part = f" · 👁 {_human_views(item['views'])}" if item["views"] else ""
         lines = [f"<b>{i}. {html.escape(headline)}</b>"]
         if body:
@@ -406,13 +421,20 @@ def build_digest_messages(date_start: datetime, selected: list[dict], total_foun
         lines.append(
             f"<a href=\"{item['url']}\">{html.escape(item['title'])}</a>{views_part}"
         )
-        blocks.append("\n".join(lines) + "\n")
+        return "\n".join(lines) + "\n"
 
-    footer = (
-        f"{'─' * 22}\n"
-        "<i>Следующая сводка — завтра в "
-        f"{config.SEND_HOUR:02d}:{config.SEND_MINUTE:02d} МСК · /digest — повторить</i>"
-    )
+    blocks: list[str] = []
+
+    if econ_posts:
+        blocks.append("💼 <b>Экономика</b>\n")
+        for i, item in enumerate(econ_posts, 1):
+            blocks.append(_post_block(i, item))
+
+    if general_posts:
+        blocks.append("\n📱 <b>Интересное</b>\n")
+        offset = len(econ_posts)
+        for i, item in enumerate(general_posts, offset + 1):
+            blocks.append(_post_block(i, item))
 
     messages: list[str] = []
     current = header
@@ -422,8 +444,6 @@ def build_digest_messages(date_start: datetime, selected: list[dict], total_foun
             current = ""
         current += block + "\n"
     if current.strip():
-        if len(current) + len(footer) + 2 <= MAX_MESSAGE_LEN:
-            current = current.rstrip() + "\n\n" + footer
         messages.append(current.rstrip())
     return messages
 
@@ -436,11 +456,12 @@ async def run_and_send(client: httpx.AsyncClient, targets: list[int] | None = No
         return
 
     date_start, results = await collect_all_posts(client)
-    selected, total_found = select_top_posts(results, config.DIGEST_TARGET)
-    messages = build_digest_messages(date_start, selected, total_found)
+    econ_posts, general_posts, total_found = select_top_posts(results)
+    messages = build_digest_messages(date_start, econ_posts, general_posts, total_found)
     log.info(
-        "Сводка готова: топ-%d из %d постов, %d сообщений, %d получателей.",
-        len(selected), total_found, len(messages), len(subscribers),
+        "Сводка: экономика=%d интересное=%d итого=%d из %d постов, %d сообщений, %d получателей.",
+        len(econ_posts), len(general_posts), len(econ_posts) + len(general_posts),
+        total_found, len(messages), len(subscribers),
     )
 
     for chat_id in subscribers:
@@ -464,17 +485,17 @@ async def handle_command(client: httpx.AsyncClient, message: dict) -> None:
 
     help_text = (
         "🏦 <b>Утренняя сводка — как это работает</b>\n\n"
-        f"Каждый день в <b>{when} МСК</b> я присылаю топ-{config.DIGEST_TARGET} "
-        "самых важных новостей экономики, банков и бизнеса — короткая выжимка "
-        "и ссылка на оригинал.\n\n"
-        "Новости отбираются из 15 деловых телеграм-каналов по охвату и "
-        "релевантности: экономика и финансы — в приоритете, инфошум — нет.\n\n"
+        f"Каждый день в <b>{when} МСК</b> я присылаю дайджест из двух частей:\n"
+        f"💼 <b>{config.ECON_SLOTS} новостей про экономику</b> — важные и понятные всем\n"
+        f"📱 <b>{config.GENERAL_SLOTS} интересных постов</b> — вирусное из деловых каналов\n\n"
+        "Источники — {len_ch} деловых Telegram-каналов. Мат, военная повестка "
+        "и реклама отфильтрованы автоматически.\n\n"
         "<b>Команды</b>\n"
         "/digest — сводка за вчера прямо сейчас\n"
         "/status — подписка, время рассылки, каналы\n"
         "/stop — отписаться от рассылки\n"
         "/help — это сообщение"
-    )
+    ).replace("{len_ch}", str(len(config.CHANNELS)))
 
     if cmd == "/start":
         is_new = add_subscriber(chat_id)
@@ -482,8 +503,8 @@ async def handle_command(client: httpx.AsyncClient, message: dict) -> None:
             reply = (
                 "👋 Добро пожаловать!\n\n"
                 f"Вы подписаны: каждый день в <b>{when} МСК</b> сюда будет "
-                f"приходить топ-{config.DIGEST_TARGET} новостей экономики и "
-                "банков за прошедший день.\n\n"
+                f"приходить дайджест — {config.ECON_SLOTS} важных экономических "
+                f"новостей и {config.GENERAL_SLOTS} интересных постов.\n\n"
                 "Хотите посмотреть, как это выглядит? Нажмите /digest — "
                 "пришлю сводку за вчера прямо сейчас. 👇"
             )
@@ -506,7 +527,7 @@ async def handle_command(client: httpx.AsyncClient, message: dict) -> None:
             "📊 <b>Статус</b>\n\n"
             f"Подписка: {'✅ активна' if subscribed else '❌ нет (включить — /start)'}\n"
             f"Рассылка: ежедневно в <b>{when} МСК</b>\n"
-            f"Новостей в сводке: до {config.DIGEST_TARGET}\n"
+            f"Новостей в сводке: {config.ECON_SLOTS} экономика + {config.GENERAL_SLOTS} интересное\n"
             f"Источников: {len(config.CHANNELS)} каналов\n"
             f"Подписчиков у бота: {len(subs)}"
         )

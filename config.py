@@ -69,9 +69,13 @@ else:
 SUMMARY_MAX_SENTENCES = int(os.getenv("SUMMARY_MAX_SENTENCES", "2"))
 SUMMARY_MAX_CHARS = int(os.getenv("SUMMARY_MAX_CHARS", "400"))
 
-# Сколько лучших постов отбирать в дневную сводку (топ по популярности).
-# Если за день постов меньше — отправляются все найденные.
-DIGEST_TARGET = int(os.getenv("DIGEST_TARGET", "25"))
+# Сколько постов в каждом слоте дайджеста.
+# Слот A — экономика (важные/понятные всем): высокая релевантность × охват.
+ECON_SLOTS = int(os.getenv("ECON_SLOTS", "5"))
+# Слот B — интересное (вирусные посты для широкой аудитории): охват в приоритете.
+GENERAL_SLOTS = int(os.getenv("GENERAL_SLOTS", "15"))
+# Устаревший параметр, оставлен для совместимости с логами.
+DIGEST_TARGET = ECON_SLOTS + GENERAL_SLOTS
 # Максимум постов от одного канала в сводке (для разнообразия топа).
 MAX_PER_CHANNEL = int(os.getenv("MAX_PER_CHANNEL", "5"))
 # Минимальная длина текста, чтобы пост считался «содержательным» для топа.
