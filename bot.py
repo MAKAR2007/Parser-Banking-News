@@ -218,8 +218,10 @@ _CONTENT_WORD_RE = re.compile(r"[а-яёa-z]{4,}", re.IGNORECASE)
 
 
 def _dedup_tokens(text: str) -> set[str]:
-    """Множество «стемов» (первые 5 букв значимых слов) из начала поста."""
-    return {w[:5] for w in _DEDUP_WORD_RE.findall(text.lower()[:400])}
+    """Множество «стемов» (первые 5 букв значимых слов) поста.
+    Берём широкое окно: больше общих основ → надёжнее ловим парафразы.
+    """
+    return {w[:5] for w in _DEDUP_WORD_RE.findall(text.lower()[:600])}
 
 
 def _is_low_quality(text: str) -> bool:
@@ -270,7 +272,7 @@ def _make_dedup_checker(scored: list[dict]):
             #    есть РЕДКИЕ (встречаются в пуле в паре постов — имена, бренды,
             #    спец-термины: «gmail», «recall»). Общие частотные слова
             #    (банк, ставка, рубль) не считаются — иначе склеим разные темы.
-            if n_shared >= 3 and containment >= 0.33:
+            if n_shared >= 3 and containment >= 0.28:
                 rare = [t for t in shared if df.get(t, 0) <= 4]
                 if len(rare) >= 2:
                     return True

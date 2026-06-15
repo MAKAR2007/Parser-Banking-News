@@ -134,6 +134,20 @@ _DRY_RE = re.compile(
 )
 
 # ---------------------------------------------------------------------------
+# ГАЙДЫ/ЛИСТИКЛЫ/ПОДБОРКИ: это контент, а не новость. Длинный пост «15 промптов
+# для Claude» легко набирает кучу ключевых слов и пролезает в новостную сводку —
+# отсекаем. Срабатывает на «<число> способов/правил/промптов…» и явных словах.
+# ---------------------------------------------------------------------------
+_HOWTO_RE = re.compile(
+    r"(?:\b\d{1,3}\s+(?:способ[а-яё]*|при[её]м[а-яё]*|промпт[а-яё]*|"
+    r"лайфхак[а-яё]*|совет[а-яё]*|причин[а-яё]*|шаг[а-яё]*|трюк[а-яё]*|"
+    r"фишк[а-яё]*|идей|инструмент[а-яё]*|правил[а-яё]+ (?:как|для|чтобы))"
+    r"|\b(?:промпт[а-яё]*|гайд[а-яё]*|чек-?лист[а-яё]*|подборк[а-яё]*|"
+    r"лайфхак[а-яё]*|шпаргалк[а-яё]*|туториал[а-яё]*|мануал[а-яё]*))",
+    re.IGNORECASE,
+)
+
+# ---------------------------------------------------------------------------
 # ЯРКОСТЬ: маркеры новостей, которые цепляют широкую аудиторию.
 # ---------------------------------------------------------------------------
 _BRIGHT_RE = re.compile(
@@ -182,6 +196,7 @@ def analyze(text: str) -> Analysis:
             return Analysis(False, 0.0, 0.05, "ad")
 
         noise = bool(_NOISE_RE.search(low))
+        howto = bool(_HOWTO_RE.search(low))
         everyday = len(_EVERYDAY_RE.findall(low))
         core = len(_CORE_RE.findall(low))
         near = len(_NEAR_RE.findall(low))
@@ -200,6 +215,8 @@ def analyze(text: str) -> Analysis:
             econ_importance *= 0.4   # сухая/иностранная аналитика — не «для всех»
         if noise:
             econ_importance *= 0.3
+        if howto:
+            econ_importance *= 0.1   # гайд/подборка — это не новость
 
         # --- Яркость (для широкой аудитории) ---
         brightness = 0.70 + min(bright, 5) * 0.22
@@ -209,8 +226,10 @@ def analyze(text: str) -> Analysis:
             brightness *= 0.70          # перевес жаргона над яркостью
         if noise:
             brightness *= 0.25          # шоу-бизнес — «яркость» не того сорта
+        if howto:
+            brightness *= 0.5           # подборка/гайд — не горячая новость
 
-        tag = f"ev={everyday},core={core},dry={dry},br={bright}"
+        tag = f"ev={everyday},core={core},dry={dry},br={bright}{',howto' if howto else ''}"
         return Analysis(False, econ_importance, brightness, tag)
     except Exception:  # noqa: BLE001
         return Analysis(False, 0.0, 0.7, "error")
